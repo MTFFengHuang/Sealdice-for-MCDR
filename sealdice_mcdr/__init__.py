@@ -1,21 +1,20 @@
 from mcdreforged.api.all import PluginServerInterface, Literal, CommandSource, GreedyText
+from websocket_server import WebsocketServer
+import threading
 import os
 import json
-import asyncio
-import websockets
-import threading
 from typing import Dict, Any
 from mc_uuid import onlineUUID, offlineUUID
 
-connected_clients = set()
+connected_clients = []
 server_instance = None
 websocket_server = None
-websocket_server_task = None
-loop = None
 config = {}
 
+
 def get_config_path():
-    return os.path.join(server_instance.get_data_folder(), 'config', 'sealdice.json')
+    return os.path.join(server_instance.get_data_folder(), 'sealdice.json')
+
 
 def create_default_config():
     config_path = get_config_path()
@@ -31,15 +30,16 @@ def create_default_config():
         "botname": "§e骰娘§r",
         "_comment6": "下面这一项是配置消息颜色的",
         "replycolor": "§b",
-        "_comment7": "颜色代码请自行参照wiki：",
-        "_comment8": "https://minecraft.fandom.com/zh/wiki/%E6%A0%BC%E5%BC%8F%E5%8C%96%E4%BB%A3%E7%A0%81?variant=zh"
+        "_comment7": "下面这一项是开关是否监听所有聊天",
+        "_comment8": "为 true 时监听所有聊天信息并发送到 SealDice，为 false 时关闭监听",
+        "enable_chat_listener": True
     }
-
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     if not os.path.exists(config_path):
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(default_config, f, ensure_ascii=False, indent=4)
         server_instance.logger.info(f'Default configuration file created at {config_path}')
+
 
 def load_config():
     global config
@@ -52,60 +52,69 @@ def load_config():
         create_default_config()
         load_config()
 
+
 def start_websocket_server():
-    global websocket_server, websocket_server_task, loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    websocket_server = websockets.serve(handle_client, config["host"], config["port"])
-    websocket_server_task = loop.run_until_complete(websocket_server)
-    try:
-        loop.run_forever()
-    finally:
-        loop.close()
+    global websocket_server
+    websocket_server = WebsocketServer(host=config["host"], port=config["port"])
+    websocket_server.set_fn_new_client(on_client_connect)
+    websocket_server.set_fn_client_left(on_client_disconnect)
+    websocket_server.set_fn_message_received(on_message_received)
+    websocket_server.run_forever()
 
-async def handle_client(websocket, path):
-    server_instance.logger.info(f'Sealdice connected: {websocket.remote_address}')
-    connected_clients.add(websocket)
-    try:
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-                content = data.get('content', '')
-                if content:
-                    formatted_message = f'{config["prefix"]}{config["botname"]}: {config["replycolor"]}{content}§r'
-                    server_instance.broadcast(formatted_message)
-            except json.JSONDecodeError:
-                server_instance.logger.warning('Received invalid JSON message from Sealdice')
-    except websockets.exceptions.ConnectionClosed:
-        server_instance.logger.info(f'Sealdice disconnected: {websocket.remote_address}')
-    finally:
-        connected_clients.remove(websocket)
 
-def send_to_sealdice(message):
+def on_client_connect(client, server):
+    connected_clients.append(client)
+    server_instance.logger.info(f"Client connected: {client['address']}")
+
+
+def on_client_disconnect(client, server):
+    connected_clients.remove(client)
+    server_instance.logger.info(f"Client disconnected: {client['address']}")
+
+
+def on_message_received(client, server, message):
+    server_instance.logger.info(f"Message received: {message}")
+    try:
+        data = json.loads(message)
+        content = data.get('content', '')
+        if content:
+            formatted_message = f'{config["prefix"]}{config["botname"]}: {config["replycolor"]}{content}§r'
+            server_instance.broadcast(formatted_message)
+    except json.JSONDecodeError:
+        server_instance.logger.warning(f"Invalid JSON received from client: {client['address']}")
+
+
+def send_to_sealdice(message: Dict[str, Any]):
     if not connected_clients:
         server_instance.logger.warning('No connected Sealdice clients to send message')
         return
     data = json.dumps(message)
-    asyncio.run(send_message_to_clients(data))
+    for client in connected_clients:
+        websocket_server.send_message(client, data)
 
-async def send_message_to_clients(message):
-    tasks = [client.send(message) for client in connected_clients if client.open]
-    if tasks:
-        await asyncio.gather(*tasks)
 
 def on_load(server: PluginServerInterface, old_module):
     global server_instance
     server_instance = server
     create_default_config()
     load_config()
+
     server.register_help_message('!!sealdice', 'Send a message to SealDice')
     server.register_command(
         Literal('!!sealdice')
         .runs(lambda src: src.reply('用法: !!sealdice <内容>'))
         .then(GreedyText('content').runs(on_sealdice_command))
     )
+
+    if config.get("enable_chat_listener", True):
+        server.logger.info("Chat listener is enabled. Listening to all chat messages.")
+        server.register_event_listener('mcdr.user_info', on_chat_message)
+    else:
+        server.logger.info("Chat listener is disabled.")
+
     threading.Thread(target=start_websocket_server, daemon=True).start()
-    server.logger.info(f'WebSocket server started at ws://{config["host"]}:{config["port"]}')
+    server.logger.info(f"WebSocket server started at ws://{config['host']}:{config['port']}")
+
 
 def on_sealdice_command(source: CommandSource, context: Dict[str, Any]):
     content = context['content']
@@ -117,13 +126,32 @@ def on_sealdice_command(source: CommandSource, context: Dict[str, Any]):
             'isAdmin': source.has_permission(3),
             'name': source.player if source.is_player else 'Console',
             'uuid': uuid if uuid else '',
-            'messageType': 'private' if source.is_player else 'group'
+            'messageType': 'private' if source.is_player else 'group',
         }
     }
     send_to_sealdice(message)
 
-def get_player_uuid(source: CommandSource) -> str:
-    player_name = source.player if source.is_player else None
+
+def on_chat_message(server: PluginServerInterface, info: Any):
+    if info.is_player:
+        player_name = info.player
+        uuid = get_player_uuid(info)
+        permission_level = server.get_permission_level(player_name)  # 获取玩家权限等级
+        message = {
+            'type': 'message',
+            'event': {
+                'content': info.content,
+                'isAdmin': permission_level >= 3,  # 判断是否是管理员
+                'name': player_name,
+                'uuid': uuid,
+                'messageType': 'group',
+            }
+        }
+        send_to_sealdice(message)
+
+
+def get_player_uuid(info: Any) -> str:
+    player_name = info.player if info.is_player else None
     if player_name:
         try:
             return str(onlineUUID(player_name))
@@ -131,14 +159,11 @@ def get_player_uuid(source: CommandSource) -> str:
             return str(offlineUUID(player_name))
     return None
 
+
 def on_unload(server: PluginServerInterface):
-    global websocket_server_task, loop
-    if websocket_server_task:
+    global websocket_server
+    if websocket_server:
         server.logger.info('Closing WebSocket server...')
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
-        loop.call_soon_threadsafe(loop.stop)
-        websocket_server_task.close()
-        loop.run_until_complete(websocket_server_task.wait_closed())
+        websocket_server.shutdown_gracefully()
         server.logger.info('WebSocket server closed')
     server.logger.info('SealDice MCDReforged Plugin unloaded')
